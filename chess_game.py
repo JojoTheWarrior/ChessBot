@@ -1,5 +1,6 @@
 # chess_game.py
 import chess
+import chess.svg
 import torch
 import numpy as np
 
@@ -91,10 +92,24 @@ def index_to_move(idx: int, board: chess.Board):
     to_sq = idx % 64
     return chess.Move(from_sq, to_sq)
 
+
+
+
+# just saving this fen as an svg
+def fen_to_svg(fen, filename="board.svg"):
+    board = chess.Board(fen)
+    svg_content = chess.svg.board(board=board)
+
+    with open("./images/" + filename, "w") as f:
+        f.write(svg_content)
+    
+    print(f"saved fen ${fen} into ${filename}")
+
 # just running this file
 if __name__ == "__main__":
     # andrew's fen
     fen = "2bq1rk1/pr3ppn/1p2p3/7P/2pP1B1P/2P5/PPQ2PB1/R3R1K1 w - -"
     tensor = fen_to_tensor(fen)
-    print("Shape:", tensor.shape)
-    print(tensor)
+    # print("Shape:", tensor.shape)
+    # print(tensor)
+    fen_to_svg(fen, "andrew_board.svg")
