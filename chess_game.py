@@ -3,6 +3,39 @@ import chess
 import torch
 import numpy as np
 
+# takes a fen and returns a 14x8x8 pytorch tensor
+def fen_to_tensor(fen):
+    board = chess.Board(fen)
+    planes = np.zeros((14, 8, 8), dtype=np.float32)
+
+    piece_map = {
+        chess.PAWN: 0,
+        chess.KNIGHT: 1,
+        chess.BISHOP: 2,
+        chess.ROOK: 3,
+        chess.QUEEN: 4,
+        chess.KING: 5,
+    }
+
+    # White = 0–5, Black = 6–11
+    for sq, pc in board.piece_map().items():
+        p = piece_map[pc.piece_type] + (0 if pc.color else 6)
+        r, c = divmod(sq, 8)
+        planes[p, 7 - r, c] = 1
+
+    # Side to move plane
+    planes[12] = 1 if board.turn == chess.WHITE else 0
+
+    # Castling rights plane
+    planes[13] = 0
+    if board.has_kingside_castling_rights(True):  planes[13, 0, 7] = 1
+    if board.has_queenside_castling_rights(True): planes[13, 0, 0] = 1
+    if board.has_kingside_castling_rights(False): planes[13, 7, 7] = 1
+    if board.has_queenside_castling_rights(False):planes[13, 7, 0] = 1
+
+    return torch.tensor(planes)
+
+
 def board_to_tensor(board: chess.Board):
     """
     Converts a python-chess board to a (14,8,8) tensor.
@@ -57,3 +90,11 @@ def index_to_move(idx: int, board: chess.Board):
     from_sq = idx // 64
     to_sq = idx % 64
     return chess.Move(from_sq, to_sq)
+
+# just running this file
+if __name__ == "__main__":
+    # andrew's fen
+    fen = "2bq1rk1/pr3ppn/1p2p3/7P/2pP1B1P/2P5/PPQ2PB1/R3R1K1 w - -"
+    tensor = fen_to_tensor(fen)
+    print("Shape:", tensor.shape)
+    print(tensor)
