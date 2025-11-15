@@ -169,42 +169,23 @@ class MCTS:
                 node.node_value = 0.0
             return
 
-        # Move ordering: captures and promotions first
-        def move_score(mv):
-            s = 0
+        # Move ordering + priors derived from inexpensive tactical heuristics
+        move_strengths = []
+        for mv in legal:
+            strength = 1.0
             if node.board.is_capture(mv):
-                s += 10
+                strength += 3.0
             if mv.promotion is not None:
-                s += 8
+                strength += 2.0
+            if node.board.is_castling(mv):
+                strength += 0.5
             node.board.push(mv)
             if node.board.is_check():
-                s += 3
+                strength += 1.5
             node.board.pop()
-            return -s
+            move_strengths.append((mv, strength))
 
-        legal.sort(key=move_score)
-
-        # compute raw evals for each child to produce priors
-        raw_evals = []
-        for mv in legal:
-            node.board.push(mv)
-            raw = self.evaluate_fn(node.board)  # white-perspective
-            raw_evals.append(raw)
-            node.board.pop()
-
-        # convert raw evals to cp-like numbers for softmax
-        cp_values = []
-        for r in raw_evals:
-            is_m, v = parse_stockfish_eval(r)
-            if is_m:
-                if v == 0:
-                    cp_values.append(0.0)
-                else:
-                    sign = 1.0 if v > 0 else -1.0
-                    # mate scaling: smaller distance → larger magnitude, but capped for softmax stability
-                    cp_values.append(sign * min(20000.0 / abs(v), 1000.0))
-            else:
-                cp_values.append(float(v))
+        move_strengths.sort(key=lambda item: item[1], reverse=True)
 
         # ------------------------
         # NUMERICALLY STABLE SOFTMAX
@@ -217,11 +198,9 @@ class MCTS:
             s = sum(exps)
             return [e / s for e in exps]
 
-        scaled_cp = [v / self.eval_scale_cp for v in cp_values]
-        priors = softmax(scaled_cp)
+        priors = softmax([strength for _, strength in move_strengths])
 
-        # create child nodes and assign priors
-        for mv, p, raw in zip(legal, priors, raw_evals):
+        for (mv, _), p in zip(move_strengths, priors):
             node.board.push(mv)
             child = self._get_or_create_node(node.board, parent=node, move=mv)
             node.board.pop()
@@ -243,15 +222,16 @@ class MCTS:
             parent_N = max(1, node.N)
             best = None
             best_score = -1e9
-            for mv, child in node.children.items():
+            for child in node.children.values():
                 Q = child.Q
                 U = self.c_puct * child.P * math.sqrt(parent_N) / (1 + child.N)
                 score = Q + U
+                if id(child) in visited:
+                    continue
                 if score > best_score:
                     best_score = score
                     best = child
-            # stop if selecting this child would form a cycle
-            if id(best) in visited:
+            if best is None:
                 return node, path
             node = best
             path.append(node)
@@ -296,22 +276,26 @@ class MCTS:
         # -----------------------------------------------------
         # 2. Compute position complexity
         # -----------------------------------------------------
-        evals = []
+        capture_count = 0
+        promotion_count = 0
+        check_count = 0
+        center_pushes = 0
+        center_squares = {chess.D4, chess.D5, chess.E4, chess.E5}
         for move in legal_moves:
+            if board.is_capture(move):
+                capture_count += 1
+            if move.promotion is not None:
+                promotion_count += 1
+            if move.to_square in center_squares:
+                center_pushes += 1
             board.push(move)
-            raw = self.evaluate_fn(board)
-            is_m, v = parse_stockfish_eval(raw)
-            if is_m:
-                cp = 0.0 if v == 0 else 20000.0 / abs(v) * (1.0 if v > 0 else -1.0)
-            else:
-                cp = float(v)
-            evals.append(cp)
+            if board.is_check():
+                check_count += 1
             board.pop()
 
-        evals = np.array(evals, dtype=np.float64)
-        volatility = evals.std() if evals.size else 0.0
         branching = len(legal_moves)
-        complexity = branching * (1.0 + volatility / max(50.0, abs(evals.mean())+1e-5))
+        tactical_weight = capture_count + 0.5 * promotion_count + 0.75 * check_count + 0.25 * center_pushes
+        complexity = branching * (1.0 + tactical_weight / max(1.0, branching))
 
         # -----------------------------------------------------
         # 3. Historical complexity smoothing
@@ -424,7 +408,7 @@ if __name__ == "__main__":
 
     # Example play: MCTS plays White until game over; human plays Black via UCI/SAN
     board = chess.Board()
-    mcts = MCTS(evaluate_fn=evaluate, total_game_time=60.0, c_puct=0.5, eval_scale_cp=400.0)
+    mcts = MCTS(evaluate_fn=evaluate, total_game_time=60.0, c_puct=1.5, eval_scale_cp=400.0)
     while not board.is_game_over():
         print(board)
         if board.turn == chess.WHITE:
