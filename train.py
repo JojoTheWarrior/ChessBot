@@ -8,6 +8,7 @@ import numpy as np
 import random
 import pandas as pd
 import os
+from get_data import load_local_parquets
 
 # this just gets the index from the kaggle URL that we pass in
 from get_shard_number import get_index
@@ -74,6 +75,10 @@ def train_model_one_shard(net, opt, loss_fn, shard_path, epochs=1, batch_size=25
 
         # save checkpoint per epoch
         torch.save(net.state_dict(), f"checkpoint_{shard_index}_epoch{epoch}.pt")
+
+# data directory
+data_dir = "./datas/"
+
 
 # training loop for ALL shards
 def train_model():
