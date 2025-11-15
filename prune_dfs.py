@@ -117,10 +117,10 @@ def bfs(rem, depth, color):
                 gb = evaluate(bd)
                 bd.pop()
                 best_ret = max(best_ret, color * gb)
-        for l in rem:
-            for item in l:
-                print(item[0], end=" ")
-            print()
+        # for l in rem:
+        #     for item in l:
+        #         print(item[0], end=" ")
+        #     print()
         return best_ret * color
     
     srt = []
@@ -189,5 +189,9 @@ def evaluate(board: chess.Board) -> float:
 
 if __name__ == "__main__":
     b = chess.Board("2bq1rk1/pr3ppn/1p2p3/7P/2pP1B1P/2P5/PPQ2PB1/R3R1K1 w - -")
-    mv = next_move(b, time_left=120.0, color=1)
-    print("Selected move:", mv)
+    c = 1
+    for i in range(10):
+        mv = next_move(b, 120.0, c)
+        print("Selected move:", mv)
+        b.push(mv)
+        c = -c
