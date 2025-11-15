@@ -8,6 +8,8 @@ import numpy as np
 import random
 import pandas as pd
 import os
+from tqdm import tqdm
+import time
 
 # this just gets the index from the kaggle URL that we pass in
 from get_shard_number import get_index
@@ -43,9 +45,16 @@ def evaluate_position(fen, net=None):
 
 # training loop for ONE shard
 def train_model_one_shard(net, opt, loss_fn, shard_path, epochs=1, batch_size=256):
-    shard_index = get_index(shard_path)
+    # shard_index = get_index(shard_path)
+    shard_index = -1
     print(f"\nLoading shard: {shard_index}")
-    df = pd.read_parquet(shard_path)
+
+    # timing how long it takes to load this parquet
+    start_time = time.time()
+    df = pd.read_parquet(shard_path, engine="pyarrow")
+    end_time = time.time()
+
+    print(f"Loading Shard {shard_index} took {end_time - start_time} seconds")
 
     dataset = ChessEvalDataset(df)
 
@@ -57,7 +66,11 @@ def train_model_one_shard(net, opt, loss_fn, shard_path, epochs=1, batch_size=25
     # training loop
     for epoch in range(epochs):
         total_loss = 0
-        for x, y in loader:
+
+        # using loading bar
+        pbar = tqdm(loader, desc=f"Shard {shard_index}, Epoch {epoch}", leave=True)
+
+        for x, y in pbar:
             x = x.to(DEVICE)
             y = y.to(DEVICE)
 
@@ -68,6 +81,9 @@ def train_model_one_shard(net, opt, loss_fn, shard_path, epochs=1, batch_size=25
             opt.step()
 
             total_loss += loss.item()
+
+            # update progress bar text
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_loss = total_loss / len(loader)
         print(f"Shard {shard_index}, Epoch {epoch}, Loss {avg_loss:.5f}")
@@ -94,6 +110,8 @@ def train_model():
         data_dir + f"train-{i:05d}-of-00016.parquet"
         for i in range(16)
     ]
+
+    shard_paths.insert(0, data_dir+"subset_100.parquet")
 
     # training over all 16 shards
     for shard in shard_paths:
