@@ -5,11 +5,16 @@ import time
 from typing import List, Optional, Tuple
 from stockfish_eval import evaluate_fen
 
+# survivors from each layer = [a1, a2, ..., a20]
+# fully branch eacy survivor
+# find best move
+# dp and dfs
+
 # -----------------------
 # Hard-coded branching factors a1..a20
 # product <= 20,000 (approx)
 # -----------------------
-BRANCHING: List[int] = [
+BRANCHING_DFS: List[int] = [
     5,  # a1
     4,  # a2
     3,  # a3
@@ -30,6 +35,28 @@ BRANCHING: List[int] = [
     1,  # a18
     1,  # a19
     1,  # a20
+]
+BRANCHING_BFS: List[int] = [
+    5,  # a1
+    10,  # a2
+    15,  # a3
+    20,  # a4
+    25,  # a5
+    30,  # a6
+    35,  # a7
+    40,  # a8
+    40,  # a9
+    40,  # a10
+    40,  # a11
+    40,  # a12
+    40,  # a13
+    40,  # a14
+    40,  # a15
+    40,  # a16
+    40,  # a17
+    40,  # a18
+    40,  # a19
+    40,  # a20
 ]
 STRAIGHT_BRANCHING = [1 for i in range(0, 20)]
 MAX_DEPTH = 20
@@ -65,11 +92,11 @@ def dfs(board: chess.Board, me, depth, color):
 
         if gb*color > me*color: # for every position that returns something better than me already
             cnt += 1
-        if cnt >= BRANCHING[depth-1]: # this means you have enough good positions
+        if cnt >= BRANCHING_DFS[depth-1]: # this means you have enough good positions
             break
 
     srt.sort(key=lambda x: x[1], reverse=True)
-    rem = srt[:BRANCHING[depth-1]]
+    rem = srt[:BRANCHING_DFS[depth-1]]
     print(rem, color)
 
     best_ret = -1e9
@@ -80,7 +107,32 @@ def dfs(board: chess.Board, me, depth, color):
         best_ret = max(best_ret, color * gb)
     
     return best_ret * color
+
+def bfs(rem, depth, color):
+    if depth == MAX_DEPTH:
+        best_ret = -1e9
+        for _, _, bd in rem[-1]:
+            for mv in bd.legal_moves:
+                bd.push(mv)
+                gb = evaluate(bd)
+                bd.pop()
+                best_ret = max(best_ret, color * gb)
+        for l in rem:
+            for item in l:
+                print(item[0], end=" ")
+            print()
+        return best_ret * color
     
+    srt = []
+    for _, _, bd in rem[-1]:
+        for mv in bd.legal_moves:
+            bd.push(mv)
+            gb = evaluate(bd)
+            srt.append((mv, gb*color, bd.copy()))
+            bd.pop()
+    srt.sort(key=lambda x: x[1], reverse=True)
+    rem.append(srt[:BRANCHING_BFS[depth-1]])
+    return bfs(rem, depth+1, -color)
 
 # color is +1 for white, -1 for black
 def next_move(board: chess.Board, time_left: float, color) -> Optional[chess.Move]:
@@ -95,7 +147,15 @@ def next_move(board: chess.Board, time_left: float, color) -> Optional[chess.Mov
     best_move, best_ret = "", -1e9
     for mv in moves:
         board.push(mv)
-        gb = dfs(board, evaluate(board), 1, -1*color)
+        # gb = dfs(board, evaluate(board), 18, -1*color)
+        srt = []
+        for mv2 in board.legal_moves:
+            board.push(mv2)
+            gb = evaluate(board)
+            srt.append((mv, gb*color, board.copy()))
+            board.pop()
+        srt.sort(key=lambda x: x[1], reverse=True)
+        gb = bfs([srt[:BRANCHING_BFS[0]]], 2, -1*color)
         if gb*color > best_ret:
             best_ret = gb*color
             best_move = mv
