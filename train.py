@@ -8,7 +8,6 @@ import numpy as np
 import random
 import pandas as pd
 import os
-from get_data import load_local_parquets
 
 # this just gets the index from the kaggle URL that we pass in
 from get_shard_number import get_index
