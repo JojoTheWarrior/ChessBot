@@ -51,7 +51,7 @@ def train_model_one_shard(net, opt, loss_fn, shard_path, epochs=1, batch_size=25
     dataset = ChessEvalDataset(df)
 
     # on laptop, always use num_workers=0; on paperspace, use 4
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
     print(f"Loaded {len(dataset)} positions from Shard {shard_index}")
     
@@ -92,7 +92,7 @@ def train_model():
 
     # loading our shards
     shard_paths = [
-        f"train-{i:05d}-of-00016.parquet"
+        data_dir + f"train-{i:05d}-of-00016.parquet"
         for i in range(16)
     ]
 
