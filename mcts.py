@@ -4,6 +4,7 @@ import chess
 import math
 import time
 import random
+import numpy as np
 from typing import Callable, Optional
 
 # -------------------------
@@ -26,16 +27,16 @@ def parse_stockfish_eval(raw):
     if isinstance(raw, (int, float)):
         return False, float(raw)
     s = str(raw).strip().lower()
-    # look for mate patterns
-    if s.startswith('m') or s.startswith('#') or s.startswith('mate') or 'mate' in s:
-        # extract integer after letters
-        import re
-        m = re.search(r'(-?\d+)', s)
+    # look for mate patterns anywhere in the string (fix: don't require startswith)
+    import re
+    if re.search(r'm(?:ate)?|#', s):
+        # extract integer if present (mate distance)
+        m = re.search(r'([+-]?\d+)', s)
         if m:
             n = int(m.group(1))
             return True, int(n)
         else:
-            # unknown mate format -> treat as big cp
+            # unknown mate format -> fallback to a large cp-like value (non-mate flag)
             return False, 100000.0
     # try to parse as float fallback
     try:
@@ -125,7 +126,7 @@ class MCTS:
             return math.tanh(cp / self.eval_scale_cp)
 
     def _get_key(self, board: chess.Board):
-        return board.transposition_key() if self.use_transposition else None
+        return board._transposition_key() if self.use_transposition else None
 
     def _get_or_create_node(self, board: chess.Board, parent=None, move=None):
         key = self._get_key(board)
@@ -258,20 +259,145 @@ class MCTS:
             node.W += v
             v = -v  # invert for parent
 
+    
+
     def _allocate_time_for_move(self, board: chess.Board):
         """
-        Simple adaptive allocation:
-        - estimate moves left: roughly 40 - fullmove_number (minimum 10)
-        - allocate remaining_time / estimated_moves_left, but not less than min_alloc
+        Fully dynamic, constant-free time allocation using:
+        - branching factor
+        - eval volatility (std dev)
+        - game phase from total material
+        - historical complexity tracking
+        - remaining time
+
+        Uses NumPy for cleaner vector math.
         """
+
+        # -----------------------------------------------------
+        # 1. Remaining time
+        # -----------------------------------------------------
         rem = self.clock.remaining()
-        # estimate moves left conservatively
-        est_moves_left = max(8, 40 - board.fullmove_number)  # tuneable
-        alloc = rem / max(1.0, est_moves_left)
-        # ensure at least min_alloc, and at most remaining
-        alloc = max(self.min_alloc, alloc)
-        alloc = min(alloc, rem)
+        if rem <= 0:
+            return 0.0
+
+        # -----------------------------------------------------
+        # 2. Branching factor
+        # -----------------------------------------------------
+        legal_moves = list(board.legal_moves)
+        branching = len(legal_moves)
+        if branching == 0:
+            return rem  # mate/stalemate failsafe
+
+        # -----------------------------------------------------
+        # 3. Eval volatility using NumPy
+        # -----------------------------------------------------
+        evals = []
+        for move in legal_moves:
+            board.push(move)
+            raw = self.evaluate_fn(board)
+
+            # convert to centipawn-like float
+            is_m, v = parse_stockfish_eval(raw)
+            if is_m:
+                if v == 0:
+                    cp = 0.0
+                else:
+                    sign = 1.0 if v > 0 else -1.0
+                    cp = sign * (20000.0 / (abs(v)))
+            else:
+                cp = float(v)
+
+            evals.append(cp)
+            board.pop()
+
+        evals = np.array(evals, dtype=np.float64)
+        mean_eval = evals.mean() if evals.size else 0.0
+        volatility = evals.std() if evals.size else 0.0
+
+        # -----------------------------------------------------
+        # 4. Material-based game phase
+        # -----------------------------------------------------
+        piece_values = {
+            chess.PAWN: 1,
+            chess.KNIGHT: 3,
+            chess.BISHOP: 3,
+            chess.ROOK: 5,
+            chess.QUEEN: 9
+        }
+
+        # Compute initial symmetric material dynamically
+        base_material = sum(
+            piece_values[p] * (
+                16 if p == chess.PAWN 
+                else 4 if p in (chess.KNIGHT, chess.BISHOP) 
+                else 4 if p == chess.ROOK 
+                else 2
+            )
+            for p in piece_values
+        )
+
+        current_material = sum(
+            piece_values.get(piece.piece_type, 0)
+            for piece in board.piece_map().values()
+        )
+
+        # 1 = opening, 0 = endgame
+        game_phase = current_material / base_material if base_material > 0 else 0.0
+
+        # -----------------------------------------------------
+        # 5. MIDGAME-CENTRIC COMPLEXITY
+        # -----------------------------------------------------
+
+        # 5a. True midgame indicator: inverted parabola
+        x = game_phase
+        midgame_phase = 4 * x * (1 - x)   # peak at midgame, 0 at opening/endgame
+
+        # 5b. Normalize volatility so opening doesn't explode
+        vol_scale = max(50.0, abs(mean_eval))
+        volatility_scaled = volatility / vol_scale
+
+        # 5c. Combine factors
+        complexity = branching * (1.0 + volatility_scaled) * midgame_phase
+
+        # -----------------------------------------------------
+        # 6. Historical complexity comparison
+        # -----------------------------------------------------
+        if not hasattr(self, "_complexity_history"):
+            self._complexity_history = []
+
+        avg_complexity = (
+            np.mean(self._complexity_history)
+            if len(self._complexity_history) > 0
+            else complexity
+        )
+
+        ratio = complexity / avg_complexity if avg_complexity > 0 else 1.0
+
+        # update rolling history
+        self._complexity_history.append(complexity)
+        self._complexity_history = self._complexity_history[-50:]
+
+        # -----------------------------------------------------
+        # 7. Smooth scaling function
+        # -----------------------------------------------------
+        alloc_fraction = ratio / (1 + ratio)   # S-shaped: bounded <1
+
+        # -----------------------------------------------------
+        # 8. Fraction of remaining time
+        # -----------------------------------------------------
+        alloc = rem * alloc_fraction
+
+        # -----------------------------------------------------
+        # 9-10. Apply min/max allocation safely
+        # -----------------------------------------------------
+        # minimum allocation: either self.min_alloc or a fraction of remaining time (for endgame)
+        min_alloc = min(self.min_alloc, rem * 0.2)  # 20% of remaining time
+        alloc = max(min_alloc, alloc)               # ensure at least minimum
+        alloc = min(alloc, 1.0)                     # hard cap: never allocate more than 1 second
         return alloc
+
+
+
 
     def search_move(self, board: chess.Board, verbose: bool=False) -> Optional[chess.Move]:
         """
