@@ -58,7 +58,7 @@ def iter_formatted_parquet_rows(filepath, limit=None):
     Requires a Parquet engine such as pyarrow or fastparquet to be installed.
     """
     # Read only the needed columns to reduce I/O and memory
-    cols = ["fen", "cp", "mate", "depth", "knodes", "line"]
+    cols = ["fen", "cp", "mate", "depth", "knodes", "line"] # <- prob unnecessary
     df = pd.read_parquet(filepath, columns=cols)  # needs pyarrow or fastparquet [web:153]
     n = 0
     for rec in df.itertuples(index=False):
