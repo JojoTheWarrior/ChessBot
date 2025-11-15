@@ -3,38 +3,43 @@ import chess
 import chess.svg
 import torch
 import numpy as np
+import torch
+import chess
 
-# takes a fen and returns a 14x8x8 pytorch tensor
+# Predefine piece_map once globally
+PIECE_MAP = {
+    chess.PAWN: 0,
+    chess.KNIGHT: 1,
+    chess.BISHOP: 2,
+    chess.ROOK: 3,
+    chess.QUEEN: 4,
+    chess.KING: 5,
+}
+
 def fen_to_tensor(fen):
     board = chess.Board(fen)
-    planes = np.zeros((14, 8, 8), dtype=np.float32)
 
-    piece_map = {
-        chess.PAWN: 0,
-        chess.KNIGHT: 1,
-        chess.BISHOP: 2,
-        chess.ROOK: 3,
-        chess.QUEEN: 4,
-        chess.KING: 5,
-    }
+    planes = torch.zeros((14, 8, 8), dtype=torch.float32)  # avoid numpy allocation + conversion
 
     # White = 0–5, Black = 6–11
     for sq, pc in board.piece_map().items():
-        p = piece_map[pc.piece_type] + (0 if pc.color else 6)
+        p = PIECE_MAP[pc.piece_type] + (0 if pc.color else 6)
         r, c = divmod(sq, 8)
         planes[p, 7 - r, c] = 1
 
     # Side to move plane
-    planes[12] = 1 if board.turn == chess.WHITE else 0
+    planes[12].fill_(1 if board.turn == chess.WHITE else 0)
 
     # Castling rights plane
-    planes[13] = 0
+    # (could be simplified by writing directly)
+    planes[13].zero_()
     if board.has_kingside_castling_rights(True):  planes[13, 0, 7] = 1
     if board.has_queenside_castling_rights(True): planes[13, 0, 0] = 1
     if board.has_kingside_castling_rights(False): planes[13, 7, 7] = 1
-    if board.has_queenside_castling_rights(False):planes[13, 7, 0] = 1
+    if board.has_queenside_castling_rights(False): planes[13, 7, 0] = 1
 
-    return torch.tensor(planes)
+    return planes
+
 
 
 def board_to_tensor(board: chess.Board):

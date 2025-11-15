@@ -10,12 +10,7 @@ import pandas as pd
 import os
 from tqdm import tqdm
 import time
-
-# this just gets the index from the kaggle URL that we pass in
-from get_shard_number import get_index
-
-# is able to take in pandas dataframes downloaded from kaggle and stream it 
-from dataset import ChessEvalDataset
+import multiprocessing  # To get the number of CPU cores
 
 # imports the neural network architecture - can edit within model.py to change hyperparameters
 from model import EvalNet, ResBlock
@@ -25,6 +20,21 @@ from chess_game import fen_to_tensor
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Dataset to load data from single unified .pt file
+class ChessUnifiedDataset(Dataset):
+    def __init__(self, data_file):
+        """
+        Loads all training data from a single .pt file.
+        """
+        self.Xs, self.Ys = torch.load(data_file)
+        print(f"Loaded {len(self.Ys)} samples from {data_file}")
+
+    def __len__(self):
+        return len(self.Ys)
+
+    def __getitem__(self, idx):
+        return self.Xs[idx], self.Ys[idx]
+
 # for loading a previously saved model, or by default, the last finished one
 def load_model(path="checkpoint_epoch_24.pt"):
     net = EvalNet().to(DEVICE)
@@ -33,7 +43,6 @@ def load_model(path="checkpoint_epoch_24.pt"):
     return net
 
 # returns a score in pawn units (-3 to +3)
-# also i dont like how this is loading the model each time - can we try to load it once then run a while loop? for the actual game of course. or send up an endpoint with flask maybe
 def evaluate_position(fen, net=None):
     if net is None:
         net = load_model()
@@ -43,36 +52,27 @@ def evaluate_position(fen, net=None):
         score = net(t).item()
     return score
 
-# training loop for ONE shard
-def train_model_one_shard(net, opt, loss_fn, shard_path, epochs=1, batch_size=256):
-    # shard_index = get_index(shard_path)
-    shard_index = -1
-    print(f"\nLoading shard: {shard_index}")
+# Training loop for the unified data file
+def train_model_unified(net, opt, loss_fn, data_file, epochs=1, batch_size=256, num_workers=4):
+    print(f"\nLoading training data from: {data_file}")
 
-    # timing how long it takes to load this parquet
-    start_time = time.time()
-    df = pd.read_parquet(shard_path, engine="pyarrow")
-    end_time = time.time()
+    dataset = ChessUnifiedDataset(data_file)
 
-    print(f"Loading Shard {shard_index} took {end_time - start_time} seconds")
+    # DataLoader with parallelism (use num_workers > 0 for parallel loading)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
 
-    dataset = ChessEvalDataset(df)
-
-    # on laptop, always use num_workers=0; on paperspace, use 4
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-
-    print(f"Loaded {len(dataset)} positions from Shard {shard_index}")
+    print(f"Loaded {len(dataset)} positions from {data_file}")
     
-    # training loop
+    # Training loop
     for epoch in range(epochs):
         total_loss = 0
 
-        # using loading bar
-        pbar = tqdm(loader, desc=f"Shard {shard_index}, Epoch {epoch}", leave=True)
+        # Progress bar for training loop
+        pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=True)
 
         for x, y in pbar:
-            x = x.to(DEVICE)
-            y = y.to(DEVICE)
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
 
             opt.zero_grad()
             pred = net(x)
@@ -82,55 +82,48 @@ def train_model_one_shard(net, opt, loss_fn, shard_path, epochs=1, batch_size=25
 
             total_loss += loss.item()
 
-            # update progress bar text
+            # Update progress bar with current loss
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_loss = total_loss / len(loader)
-        print(f"Shard {shard_index}, Epoch {epoch}, Loss {avg_loss:.5f}")
+        print(f"Epoch {epoch}, Loss {avg_loss:.5f}")
 
-        # save checkpoint per epoch
-        torch.save(net.state_dict(), f"checkpoint_{shard_index}_epoch{epoch}.pt")
+        # Save checkpoint per epoch
+        torch.save(net.state_dict(), f"checkpoint_epoch{epoch}.pt")
 
-# data directory
+# Data directory
 data_dir = "./datas/"
 
-
-# training loop for ALL shards
+# Training loop for all data from a unified .pt file
 def train_model():
+    # Confirm if we're using GPU or CPU
+    print(f"Training on {DEVICE}.")
+
+    # Dynamically set the number of workers to the number of available CPU cores
+    num_workers = multiprocessing.cpu_count()
+
+    # Print the number of workers
+    print(f"Using {num_workers} CPU workers for data loading.")
+
     net = EvalNet().to(DEVICE)
 
-    # shouldn't we be using SGD instead of Adam here?
+    # Using Adam optimizer, but you could use SGD if needed
     opt = torch.optim.Adam(net.parameters(), lr=1e-3)
     
-    # our loss function is the mse (mean squared error) between what our model outputted and the eval bar from andrew's dataset
+    # MSE Loss function (mean squared error)
     loss_fn = nn.MSELoss()
 
-    # loading our shards
-    shard_paths = [
-        data_dir + f"train-{i:05d}-of-00016.parquet"
-        for i in range(16)
-    ]
+    # Load the unified .pt file with all the training data
+    data_file = os.path.join(data_dir, "chunks/train_chunk_000.pt")
 
-    shard_paths.insert(0, data_dir+"subset_100.parquet")
+    # Training over all epochs
+    train_model_unified(net, opt, loss_fn, data_file=data_file, epochs=3, batch_size=256, num_workers=num_workers)
 
-    # training over all 16 shards
-    for shard in shard_paths:
-        if not os.path.exists(shard):
-            print(f"Missing shard {shard}, skipping.")
-            continue
-
-        train_model_one_shard(net, opt, loss_fn, shard_path=shard, epochs=1)
-
-        # OPTIONAL: delete shard to save space
-        os.remove(shard)
-        print(f"Deleted shard {shard} to save space")
-
-    # done message
+    # Final message after training completes
     print("Training complete.")
     torch.save(net.state_dict(), "final_model.pt")
 
-
-# just main code for testing
+# Main entry point
 if __name__ == "__main__":
     train_model()
 
