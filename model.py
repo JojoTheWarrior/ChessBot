@@ -1,62 +1,45 @@
-# model.py
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+import chess
+import numpy as np
+import random
 
-# provides this class
-class ChessNet(nn.Module):
-    def __init__(self, channels=64):
+# this uses a "skip connection" to add the input to the output
+class ResBlock(nn.Module):
+    def __init__(self, c):
         super().__init__()
+        self.c1 = nn.Conv2d(c, c, 3, padding=1)
+        self.b1 = nn.BatchNorm2d(c)
+        self.c2 = nn.Conv2d(c, c, 3, padding=1)
+        self.b2 = nn.BatchNorm2d(c)
 
-        self.input_conv = nn.Sequential(
-            nn.Conv2d(14, channels, kernel_size=3, padding=1),
+    def forward(self, x):
+        y = F.relu(self.b1(self.c1(x)))
+        y = self.b2(self.c2(y))
+        return F.relu(x + y)
+
+# this is my neural network
+class EvalNet(nn.Module):
+    def __init__(self, channels=96, blocks=10):
+        super().__init__()
+        self.input = nn.Sequential(
+            nn.Conv2d(14, channels, 3, padding=1),
             nn.BatchNorm2d(channels),
             nn.ReLU()
         )
-
-        # 5 residual blocks (can add more)
-        self.res_blocks = nn.Sequential(
-            *[ResidualBlock(channels) for _ in range(5)]
+        self.res = nn.Sequential(*[ResBlock(channels) for _ in range(blocks)])
+        self.head = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(channels * 8 * 8, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)           # outputs centipawn eval normalized
         )
 
-        # Policy head: outputs 4672 logits
-        self.policy_conv = nn.Conv2d(channels, 32, kernel_size=1)
-        self.policy_bn = nn.BatchNorm2d(32)
-        self.policy_fc = nn.Linear(32 * 8 * 8, 4672)
-
-        # Value head: outputs scalar evaluation
-        self.value_conv = nn.Conv2d(channels, 32, kernel_size=1)
-        self.value_bn = nn.BatchNorm2d(32)
-        self.value_fc1 = nn.Linear(32 * 8 * 8, 64)
-        self.value_fc2 = nn.Linear(64, 1)
-
     def forward(self, x):
-        x = self.input_conv(x)
-        x = self.res_blocks(x)
-
-        # Policy
-        p = F.relu(self.policy_bn(self.policy_conv(x)))
-        p = p.view(p.size(0), -1)
-        p = self.policy_fc(p)
-
-        # Value
-        v = F.relu(self.value_bn(self.value_conv(x)))
-        v = v.view(v.size(0), -1)
-        v = F.relu(self.value_fc1(v))
-        v = torch.tanh(self.value_fc2(v))
-
-        return p, v
-    
-
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-
-    def forward(self, x):
-        y = F.relu(self.bn1(self.conv1(x)))
-        y = self.bn2(self.conv2(y))
-        return F.relu(x + y)
+        x = self.input(x)
+        x = self.res(x)
+        x = self.head(x)
+        return x.squeeze(-1)
