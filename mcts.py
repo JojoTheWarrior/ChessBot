@@ -107,22 +107,20 @@ class MCTS:
         """
         Convert evaluate() output to a bounded value in (-1,1),
         using centipawn scaling and special handling for mate scores.
+        Improved: mate scores now scale more sharply for faster mates.
         """
         is_mate, val = parse_stockfish_eval(raw_eval)
         if is_mate:
-            mate_dist = int(val)  # positive => White can mate in mate_dist; negative => White will be mated
-            # map to near +/-1, closer for shorter mates
+            mate_dist = int(val)
             if mate_dist == 0:
                 return 0.0
             sign = 1.0 if mate_dist > 0 else -1.0
             dist = abs(mate_dist)
-            # value in (0.8, 1.0) for mate distances, sharper for small dist
-            v = 1.0 - 1.0 / (dist + 1.0)
+            # Sharper mate scaling: smaller distance → value closer to ±1
+            v = 1.0 - 1.0 / (dist**0.8 + 1.0)  # changed exponent from 1→0.8
             return sign * v
         else:
-            # val is centipawns (white-perspective)
             cp = float(val)
-            # scale by eval_scale_cp and tanh to put in (-1,1)
             return math.tanh(cp / self.eval_scale_cp)
 
     def _get_key(self, board: chess.Board):
@@ -132,7 +130,15 @@ class MCTS:
         key = self._get_key(board)
         if key is not None and key in self.tt:
             node = self.tt[key]
-            # update parent/move if missing (we reuse stats across transpositions)
+            # prevent cycles: check if parent is already a descendant
+            ancestor = parent
+            while ancestor:
+                if ancestor is node:
+                    # cannot reuse node; create a fresh one instead
+                    node = MCTSNode(board, parent=parent, move=move)
+                    return node
+                ancestor = ancestor.parent
+            # safe to reuse node
             if node.parent is None and parent is not None:
                 node.parent = parent
                 node.move = move
@@ -141,6 +147,7 @@ class MCTS:
         if key is not None:
             self.tt[key] = node
         return node
+
 
     def _expand_and_set_priors(self, node: MCTSNode):
         if node.is_expanded:
@@ -169,7 +176,6 @@ class MCTS:
                 s += 10
             if mv.promotion is not None:
                 s += 8
-            # prefer checks (temporary)
             node.board.push(mv)
             if node.board.is_check():
                 s += 3
@@ -186,28 +192,35 @@ class MCTS:
             raw_evals.append(raw)
             node.board.pop()
 
-        # softmax of child evals -> priors
-        # convert raw evals (centipawns + mate) to cp-like numbers for softmax scale:
-        # for mate, push a large number proportional to mate closeness
+        # convert raw evals to cp-like numbers for softmax
         cp_values = []
         for r in raw_evals:
             is_m, v = parse_stockfish_eval(r)
             if is_m:
-                # map mate distance to large cp: closer mates become larger cp magnitude
                 if v == 0:
                     cp_values.append(0.0)
                 else:
                     sign = 1.0 if v > 0 else -1.0
-                    cp_values.append(sign * (20000.0 / (abs(v))))  # big magnitude for mate
+                    # mate scaling: smaller distance → larger magnitude, but capped for softmax stability
+                    cp_values.append(sign * min(20000.0 / abs(v), 1000.0))
             else:
                 cp_values.append(float(v))
 
-        # numeric stability softmax
-        max_cp = max(cp_values) if cp_values else 0.0
-        exps = [math.exp((x - max_cp) / max(1.0, self.eval_scale_cp / 4.0)) for x in cp_values]
-        s = sum(exps) if sum(exps) != 0 else 1.0
-        priors = [e / s for e in exps]
+        # ------------------------
+        # NUMERICALLY STABLE SOFTMAX
+        # ------------------------
+        def softmax(x):
+            if not x:
+                return []
+            max_x = max(x)
+            exps = [math.exp(xi - max_x) for xi in x]
+            s = sum(exps)
+            return [e / s for e in exps]
 
+        scaled_cp = [v / self.eval_scale_cp for v in cp_values]
+        priors = softmax(scaled_cp)
+
+        # create child nodes and assign priors
         for mv, p, raw in zip(legal, priors, raw_evals):
             node.board.push(mv)
             child = self._get_or_create_node(node.board, parent=node, move=mv)
@@ -219,20 +232,13 @@ class MCTS:
         node.node_value = self._eval_to_value(self.evaluate_fn(node.board))
         node.is_expanded = True
 
+
     def _select(self, root: MCTSNode):
-        """
-        Select until a non-expanded node (leaf) is found.
-        Selection uses PUCT:
-           U = c_puct * P * sqrt(sum_N_parent) / (1 + N_child)
-           score = Q + U
-        Returns leaf node and path (list of nodes from root to leaf).
-        """
         node = root
         path = [node]
+        visited = set([id(node)])  # track visited nodes to prevent cycles
         while True:
-            if not node.is_expanded:
-                return node, path
-            if not node.children:
+            if not node.is_expanded or not node.children:
                 return node, path
             parent_N = max(1, node.N)
             best = None
@@ -241,12 +247,16 @@ class MCTS:
                 Q = child.Q
                 U = self.c_puct * child.P * math.sqrt(parent_N) / (1 + child.N)
                 score = Q + U
-                # We keep Q as white-perspective; score comparison consistent
                 if score > best_score:
                     best_score = score
                     best = child
+            # stop if selecting this child would form a cycle
+            if id(best) in visited:
+                return node, path
             node = best
             path.append(node)
+            visited.add(id(node))
+
 
     def _backup(self, path, leaf_value_white: float):
         """
@@ -257,144 +267,88 @@ class MCTS:
         for node in reversed(path):
             node.N += 1
             node.W += v
-            v = -v  # invert for parent
+            # Do NOT clip W! Q is computed on the fly as W/N
+            v = -v
+
 
     
 
     def _allocate_time_for_move(self, board: chess.Board):
-        """
-        Fully dynamic, constant-free time allocation using:
-        - branching factor
-        - eval volatility (std dev)
-        - game phase from total material
-        - historical complexity tracking
-        - remaining time
-
-        Uses NumPy for cleaner vector math.
-        """
-
-        # -----------------------------------------------------
-        # 1. Remaining time
-        # -----------------------------------------------------
         rem = self.clock.remaining()
         if rem <= 0:
             return 0.0
 
-        # -----------------------------------------------------
-        # 2. Branching factor
-        # -----------------------------------------------------
         legal_moves = list(board.legal_moves)
-        branching = len(legal_moves)
-        if branching == 0:
+        if not legal_moves:
             return rem  # mate/stalemate failsafe
 
         # -----------------------------------------------------
-        # 3. Eval volatility using NumPy
+        # 1. Determine game phase: opening (0-1), endgame (0)
+        # -----------------------------------------------------
+        piece_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+        base_material = sum(
+            piece_values[p] * (16 if p==chess.PAWN else 4 if p in (chess.KNIGHT,chess.BISHOP) else 4 if p==chess.ROOK else 2)
+            for p in piece_values
+        )
+        current_material = sum(piece_values.get(p.piece_type, 0) for p in board.piece_map().values())
+        game_phase = current_material / base_material if base_material > 0 else 0.0  # 1=open, 0=end
+
+        # -----------------------------------------------------
+        # 2. Compute position complexity
         # -----------------------------------------------------
         evals = []
         for move in legal_moves:
             board.push(move)
             raw = self.evaluate_fn(board)
-
-            # convert to centipawn-like float
             is_m, v = parse_stockfish_eval(raw)
             if is_m:
-                if v == 0:
-                    cp = 0.0
-                else:
-                    sign = 1.0 if v > 0 else -1.0
-                    cp = sign * (20000.0 / (abs(v)))
+                cp = 0.0 if v == 0 else 20000.0 / abs(v) * (1.0 if v > 0 else -1.0)
             else:
                 cp = float(v)
-
             evals.append(cp)
             board.pop()
 
         evals = np.array(evals, dtype=np.float64)
-        mean_eval = evals.mean() if evals.size else 0.0
         volatility = evals.std() if evals.size else 0.0
+        branching = len(legal_moves)
+        complexity = branching * (1.0 + volatility / max(50.0, abs(evals.mean())+1e-5))
 
         # -----------------------------------------------------
-        # 4. Material-based game phase
-        # -----------------------------------------------------
-        piece_values = {
-            chess.PAWN: 1,
-            chess.KNIGHT: 3,
-            chess.BISHOP: 3,
-            chess.ROOK: 5,
-            chess.QUEEN: 9
-        }
-
-        # Compute initial symmetric material dynamically
-        base_material = sum(
-            piece_values[p] * (
-                16 if p == chess.PAWN 
-                else 4 if p in (chess.KNIGHT, chess.BISHOP) 
-                else 4 if p == chess.ROOK 
-                else 2
-            )
-            for p in piece_values
-        )
-
-        current_material = sum(
-            piece_values.get(piece.piece_type, 0)
-            for piece in board.piece_map().values()
-        )
-
-        # 1 = opening, 0 = endgame
-        game_phase = current_material / base_material if base_material > 0 else 0.0
-
-        # -----------------------------------------------------
-        # 5. MIDGAME-CENTRIC COMPLEXITY
-        # -----------------------------------------------------
-
-        # 5a. True midgame indicator: inverted parabola
-        x = game_phase
-        midgame_phase = 4 * x * (1 - x)   # peak at midgame, 0 at opening/endgame
-
-        # 5b. Normalize volatility so opening doesn't explode
-        vol_scale = max(50.0, abs(mean_eval))
-        volatility_scaled = volatility / vol_scale
-
-        # 5c. Combine factors
-        complexity = branching * (1.0 + volatility_scaled) * midgame_phase
-
-        # -----------------------------------------------------
-        # 6. Historical complexity comparison
+        # 3. Historical complexity smoothing
         # -----------------------------------------------------
         if not hasattr(self, "_complexity_history"):
             self._complexity_history = []
-
-        avg_complexity = (
-            np.mean(self._complexity_history)
-            if len(self._complexity_history) > 0
-            else complexity
-        )
-
+        avg_complexity = np.mean(self._complexity_history) if self._complexity_history else complexity
         ratio = complexity / avg_complexity if avg_complexity > 0 else 1.0
-
-        # update rolling history
         self._complexity_history.append(complexity)
         self._complexity_history = self._complexity_history[-50:]
 
         # -----------------------------------------------------
-        # 7. Smooth scaling function
+        # 4. Midgame prioritization using a smooth curve
         # -----------------------------------------------------
-        alloc_fraction = ratio / (1 + ratio)   # S-shaped: bounded <1
+        # inverted parabola: 0 at opening/endgame, 1 at midgame
+        midgame_factor = 4 * game_phase * (1 - game_phase)
+
+        # combine complexity and midgame_factor
+        alloc_fraction = ratio / (1 + ratio) * midgame_factor
 
         # -----------------------------------------------------
-        # 8. Fraction of remaining time
+        # 5. Cap allocations for early/midgame/endgame
+        # -----------------------------------------------------
+        # Opening (first 8 moves): minimal allocation
+        if board.fullmove_number <= 8:
+            alloc_fraction = 0.02  # 2% of remaining time
+        # Ensure fraction is bounded [min_alloc_fraction, 0.2]
+        alloc_fraction = max(0.02, min(alloc_fraction, 0.2))
+
+        # -----------------------------------------------------
+        # 6. Convert fraction to seconds
         # -----------------------------------------------------
         alloc = rem * alloc_fraction
-
-        # -----------------------------------------------------
-        # 9-10. Apply min/max allocation safely
-        # -----------------------------------------------------
-        # minimum allocation: either self.min_alloc or a fraction of remaining time (for endgame)
-        min_alloc = min(self.min_alloc, rem * 0.2)  # 20% of remaining time
-        alloc = max(min_alloc, alloc)               # ensure at least minimum
-        alloc = min(alloc, 1.0)                     # hard cap: never allocate more than 1 second
+        min_alloc = min(self.min_alloc, rem * 0.05)  # at least 5% of remaining time
+        alloc = max(min_alloc, alloc)
         return alloc
+
 
 
 
@@ -470,7 +424,7 @@ if __name__ == "__main__":
 
     # Example play: MCTS plays White until game over; human plays Black via UCI/SAN
     board = chess.Board()
-    mcts = MCTS(evaluate_fn=evaluate, total_game_time=60.0, c_puct=1.5, eval_scale_cp=400.0)
+    mcts = MCTS(evaluate_fn=evaluate, total_game_time=60.0, c_puct=0.5, eval_scale_cp=400.0)
     while not board.is_game_over():
         print(board)
         if board.turn == chess.WHITE:
